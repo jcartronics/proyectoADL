@@ -2,6 +2,10 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import api from "../api/axiosConfig.js";
 
+// Estrategia de reintentos: tiempos crecientes para cubrir cold starts (Render u otros)
+const CATEGORY_FETCH_TIMEOUTS = [10000, 20000, 30000]; // ms
+const MAX_ATTEMPTS = CATEGORY_FETCH_TIMEOUTS.length;
+
 const CategoriesContext = createContext();
 
 export const CategoriesProvider = ({ children }) => {
@@ -10,53 +14,76 @@ export const CategoriesProvider = ({ children }) => {
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    const fetchCategories = async () => {
-      try {
-        setLoading(true);
-        setError(null);
+    const fetchWithRetry = async () => {
+      setLoading(true);
+      setError(null);
 
-        // Intentar cargar desde cache primero para mostrar rápido
-        const cached = localStorage.getItem("marketplace_categories");
-        if (cached && cached !== "undefined") {
+      // Cargar cache primero (respuesta rápida)
+      const cached = localStorage.getItem("marketplace_categories");
+      if (cached && cached !== "undefined") {
+        try {
           setCategories(JSON.parse(cached));
+        } catch {
+          // Ignorar parse error y continuar
         }
+      }
 
-        // Luego actualizar desde API
-        const response = await api.get('/categoria',
-          {
-            timeout: 10000, // 10 segundos timeout
+      let lastError = null;
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+          const timeout = CATEGORY_FETCH_TIMEOUTS[attempt - 1];
+          const response = await api.get("/categoria", { timeout });
+          const newCategories = response.data.categorias || [];
+          setCategories(newCategories);
+          localStorage.setItem(
+            "marketplace_categories",
+            JSON.stringify(newCategories)
+          );
+          lastError = null;
+          break; // éxito
+        } catch (err) {
+          lastError = err;
+          const isTimeout = err.code === "ECONNABORTED";
+          const isNetwork = !err.response;
+          console.warn(
+            `Categorías intento ${attempt}/${MAX_ATTEMPTS} fallido`,
+            err.message
+          );
+          // Esperar antes del próximo intento solo si quedan intentos
+          if (attempt < MAX_ATTEMPTS && (isTimeout || isNetwork)) {
+            // Pequeño backoff exponencial base 500ms
+            const delay = 500 * attempt;
+            await new Promise((r) => setTimeout(r, delay));
+            continue;
+          } else {
+            break;
           }
-        );
+        }
+      }
 
-        const newCategories = response.data.categorias;
-        setCategories(newCategories);
-        localStorage.setItem(
-          "marketplace_categories",
-          JSON.stringify(newCategories)
+      if (lastError) {
+        setError(
+          lastError.response?.data?.message ||
+            `Error cargando categorías. Reintentos: ${MAX_ATTEMPTS}`
         );
-      } catch (err) {
-        setError(err.response?.data?.message || "Error cargando categorías");
-        console.error("Categories API error:", err);
-
-        // Si no hay cache y falló la API, mantener loading false
-        const cached = localStorage.getItem("marketplace_categories");
         if (!cached) {
           setCategories([]);
         }
-      } finally {
-        setLoading(false);
+        console.error("Categories API error:", lastError);
       }
+
+      setLoading(false);
     };
 
-    fetchCategories();
+    fetchWithRetry();
   }, []);
 
   // Función para forzar recarga (útil cuando se agregan categorías)
   const refreshCategories = async () => {
     try {
       setLoading(true);
-      const response = await axios.get("/api/categories");
-      const newCategories = response.data;
+      const response = await api.get("/categoria", { timeout: 15000 });
+      const newCategories = response.data.categorias || [];
       setCategories(newCategories);
       localStorage.setItem(
         "marketplace_categories",
